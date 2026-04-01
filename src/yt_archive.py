@@ -239,13 +239,19 @@ def sync_collection(
 
 
 def fetch_metadata_for_collection(
-    db: sqlite3.Connection, collection_id: int, cfg: dict
+    db: sqlite3.Connection, collection_id: int, cfg: dict, reassign: bool = False
 ):
-    """Backfill metadata for videos that are missing it (e.g. imported from archive)."""
+    """Backfill metadata for videos that are missing it (e.g. imported from archive).
+
+    If reassign=True, videos whose channel_id doesn't match their current
+    collection are moved to the correct channel-based collection (auto-created
+    if needed).  This is the intended workflow after a bulk import into a
+    dummy/catch-all collection.
+    """
     from yt_dlp import YoutubeDL
 
     rows = db.execute(
-        "SELECT extractor, video_id FROM videos WHERE collection_id = ? AND title IS NULL",
+        "SELECT id, extractor, video_id FROM videos WHERE collection_id = ? AND title IS NULL",
         (collection_id,),
     ).fetchall()
 
@@ -264,36 +270,85 @@ def fetch_metadata_for_collection(
     opts.pop("allsubtitles", None)
     opts.pop("postprocessors", None)
 
+    reassigned = 0
+    total = len(rows)
+
     with YoutubeDL(opts) as ydl:
-        for row in rows:
+        for i, row in enumerate(rows, 1):
             url = f"https://www.youtube.com/watch?v={row['video_id']}"
-            print(f"  Fetching metadata for {row['video_id']}...")
+            print(f"  [{i}/{total}] Fetching metadata for {row['video_id']}...")
             try:
                 info = ydl.extract_info(url, download=False)
-                if info:
-                    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                    db.execute(
-                        """
-                        UPDATE videos SET
-                            title = ?, uploader = ?, uploader_id = ?,
-                            upload_date = ?, duration = ?, resolution = ?
-                        WHERE extractor = ? AND video_id = ? AND collection_id = ?
-                        """,
-                        (
-                            info.get("title"),
-                            info.get("uploader"),
-                            info.get("uploader_id"),
-                            info.get("upload_date"),
-                            info.get("duration"),
-                            info.get("resolution"),
-                            row["extractor"],
-                            row["video_id"],
-                            collection_id,
-                        ),
-                    )
-                    db.commit()
+                if not info:
+                    continue
+
+                target_collection_id = collection_id
+
+                if reassign:
+                    channel_id = info.get("channel_id")
+                    if channel_id:
+                        channel_name = (
+                            info.get("uploader") or info.get("channel") or channel_id
+                        )
+                        proper_id = _get_or_create_collection(
+                            db, channel_id, channel_name
+                        )
+                        if proper_id != collection_id:
+                            # Check if video already exists in the target collection
+                            dup = db.execute(
+                                "SELECT id FROM videos WHERE extractor = ? AND video_id = ? AND collection_id = ?",
+                                (row["extractor"], row["video_id"], proper_id),
+                            ).fetchone()
+                            if dup:
+                                # Already in the right collection; delete the stale row
+                                db.execute(
+                                    "DELETE FROM videos WHERE id = ?", (row["id"],)
+                                )
+                                db.commit()
+                                reassigned += 1
+                                continue
+                            target_collection_id = proper_id
+                            reassigned += 1
+
+                db.execute(
+                    """
+                    UPDATE videos SET
+                        collection_id = ?,
+                        title = ?, uploader = ?, uploader_id = ?,
+                        upload_date = ?, duration = ?, resolution = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        target_collection_id,
+                        info.get("title"),
+                        info.get("uploader"),
+                        info.get("uploader_id"),
+                        info.get("upload_date"),
+                        info.get("duration"),
+                        info.get("resolution"),
+                        row["id"],
+                    ),
+                )
+                db.commit()
             except Exception as e:
                 print(f"  Failed to fetch metadata for {row['video_id']}: {e}")
+
+    if reassign and reassigned:
+        print(f"  Reassigned {reassigned} videos to their proper collections.")
+        # Report if the source collection is now empty
+        remaining = db.execute(
+            "SELECT COUNT(*) as c FROM videos WHERE collection_id = ?",
+            (collection_id,),
+        ).fetchone()["c"]
+        if remaining == 0:
+            col_name = db.execute(
+                "SELECT name FROM collections WHERE id = ?", (collection_id,)
+            ).fetchone()
+            if col_name:
+                print(
+                    f"  Collection '{col_name['name']}' is now empty and can be removed with: "
+                    f"yt-archive remove {col_name['name']}"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -301,24 +356,169 @@ def fetch_metadata_for_collection(
 # ---------------------------------------------------------------------------
 
 
-def import_archive(db: sqlite3.Connection, archive_path: Path, collection_id: int):
-    """Import an existing yt-dlp archive.txt into the database."""
-    entries = _read_archive_file(archive_path)
-    count = 0
-    for extractor, video_id in entries:
+def _get_or_create_collection(
+    db: sqlite3.Connection, channel_id: str, channel_name: str
+) -> int:
+    """Find an existing collection by channel URL, or create one."""
+    channel_url = f"https://www.youtube.com/channel/{channel_id}"
+    row = db.execute(
+        "SELECT id FROM collections WHERE url = ?", (channel_url,)
+    ).fetchone()
+    if row:
+        return row["id"]
+    # Use the channel name as the collection name, dedup if needed
+    base_name = channel_name or channel_id
+    name = base_name
+    suffix = 1
+    while True:
         try:
             db.execute(
-                """
-                INSERT OR IGNORE INTO videos (extractor, video_id, collection_id, status)
-                VALUES (?, ?, ?, 'imported')
-                """,
-                (extractor, video_id, collection_id),
+                "INSERT INTO collections (name, url) VALUES (?, ?)",
+                (name, channel_url),
             )
-            count += 1
+            db.commit()
+            row = db.execute(
+                "SELECT id FROM collections WHERE url = ?", (channel_url,)
+            ).fetchone()
+            print(f"  Auto-created collection '{name}' for channel {channel_id}")
+            return row["id"]
         except sqlite3.IntegrityError:
-            pass
-    db.commit()
+            suffix += 1
+            name = f"{base_name} ({suffix})"
+
+
+def _resolve_video_collection(
+    db: sqlite3.Connection, extractor: str, video_id: str, cfg: dict
+) -> int | None:
+    """Use yt-dlp to fetch lightweight metadata and resolve the collection for a video."""
+    from yt_dlp import YoutubeDL
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+
+    opts = config_to_ytdlp_opts(cfg)
+    opts["skip_download"] = True
+    opts["ignoreerrors"] = True
+    opts["quiet"] = True
+    # Strip options that write files
+    for key in (
+        "writedescription",
+        "writethumbnail",
+        "writesubtitles",
+        "allsubtitles",
+        "postprocessors",
+        "outtmpl",
+        "paths",
+    ):
+        opts.pop(key, None)
+
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if not info:
+            return None
+        channel_id = info.get("channel_id")
+        if not channel_id:
+            return None
+        channel_name = info.get("uploader") or info.get("channel") or channel_id
+        collection_id = _get_or_create_collection(db, channel_id, channel_name)
+
+        # Also backfill metadata while we have it
+        db.execute(
+            """
+            UPDATE videos SET
+                title = COALESCE(title, ?), uploader = COALESCE(uploader, ?),
+                uploader_id = COALESCE(uploader_id, ?),
+                upload_date = COALESCE(upload_date, ?),
+                duration = COALESCE(duration, ?), resolution = COALESCE(resolution, ?)
+            WHERE extractor = ? AND video_id = ? AND collection_id = ?
+            """,
+            (
+                info.get("title"),
+                info.get("uploader"),
+                info.get("uploader_id"),
+                info.get("upload_date"),
+                info.get("duration"),
+                info.get("resolution"),
+                extractor,
+                video_id,
+                collection_id,
+            ),
+        )
+        db.commit()
+        return collection_id
+    except Exception as e:
+        print(f"  Warning: could not resolve collection for {video_id}: {e}")
+        return None
+
+
+def import_archive(
+    db: sqlite3.Connection,
+    archive_path: Path,
+    collection_id: int | None = None,
+    cfg: dict | None = None,
+):
+    """Import an existing yt-dlp archive.txt into the database.
+
+    If collection_id is provided, all entries go into that collection.
+    Otherwise, yt-dlp is used to fetch metadata for each video to determine
+    its channel, and collections are auto-created as needed.
+    """
+    entries = _read_archive_file(archive_path)
+    count = 0
+    skipped = 0
+
+    if collection_id is not None:
+        # Simple mode: all videos go to one collection
+        for extractor, video_id in entries:
+            try:
+                db.execute(
+                    """
+                    INSERT OR IGNORE INTO videos (extractor, video_id, collection_id, status)
+                    VALUES (?, ?, ?, 'imported')
+                    """,
+                    (extractor, video_id, collection_id),
+                )
+                count += 1
+            except sqlite3.IntegrityError:
+                pass
+        db.commit()
+    else:
+        # Auto-discover mode: resolve collection per video via yt-dlp
+        cfg = cfg or {}
+        total = len(entries)
+        for i, (extractor, video_id) in enumerate(entries, 1):
+            # Skip if already in the DB under any collection
+            existing = db.execute(
+                "SELECT id FROM videos WHERE extractor = ? AND video_id = ?",
+                (extractor, video_id),
+            ).fetchone()
+            if existing:
+                skipped += 1
+                continue
+
+            print(f"  [{i}/{total}] Resolving {extractor} {video_id}...")
+            resolved_id = _resolve_video_collection(db, extractor, video_id, cfg)
+            if resolved_id is None:
+                print(f"  Could not resolve collection for {video_id}, skipping.")
+                skipped += 1
+                continue
+
+            try:
+                db.execute(
+                    """
+                    INSERT OR IGNORE INTO videos (extractor, video_id, collection_id, status)
+                    VALUES (?, ?, ?, 'imported')
+                    """,
+                    (extractor, video_id, resolved_id),
+                )
+                count += 1
+            except sqlite3.IntegrityError:
+                pass
+        db.commit()
+
     print(f"Imported {count} entries into the database.")
+    if skipped:
+        print(f"Skipped {skipped} entries (already present or unresolvable).")
 
 
 # ---------------------------------------------------------------------------
@@ -406,29 +606,41 @@ def cmd_fetch_metadata(args):
     db = get_db()
     cfg = load_config(Path(args.config) if args.config else None)
     collections = _resolve_collections(db, args)
+    reassign = getattr(args, "reassign", False)
 
     for col in collections:
         print(f"Fetching metadata for '{col['name']}'...")
-        fetch_metadata_for_collection(db, col["id"], cfg)
+        fetch_metadata_for_collection(db, col["id"], cfg, reassign=reassign)
 
     db.close()
 
 
 def cmd_import(args):
     db = get_db()
-    row = db.execute(
-        "SELECT * FROM collections WHERE name = ?", (args.collection,)
-    ).fetchone()
-    if not row:
-        print(f"Error: collection '{args.collection}' not found.", file=sys.stderr)
-        print("Create it first with: yt-archive add <name> <url>")
-        sys.exit(1)
+    cfg = load_config(Path(args.config) if args.config else None)
+
+    collection_id = None
+    if args.collection:
+        row = db.execute(
+            "SELECT * FROM collections WHERE name = ?", (args.collection,)
+        ).fetchone()
+        if not row:
+            print(f"Error: collection '{args.collection}' not found.", file=sys.stderr)
+            print("Create it first with: yt-archive add <name> <url>")
+            sys.exit(1)
+        collection_id = row["id"]
+
     path = Path(args.file)
     if not path.exists():
         print(f"Error: file '{path}' not found.", file=sys.stderr)
         sys.exit(1)
 
-    import_archive(db, path, row["id"])
+    if collection_id is None:
+        print(
+            "No --collection specified; auto-discovering channels via yt-dlp metadata..."
+        )
+
+    import_archive(db, path, collection_id=collection_id, cfg=cfg)
     db.close()
 
 
@@ -507,13 +719,24 @@ def main():
     p_meta_g = p_meta.add_mutually_exclusive_group(required=True)
     p_meta_g.add_argument("name", nargs="?", help="Collection name")
     p_meta_g.add_argument("--all", action="store_true", help="All collections")
+    p_meta.add_argument(
+        "--reassign",
+        action="store_true",
+        default=False,
+        help="Reassign videos to their proper channel-based collections (useful after bulk import into a dummy collection)",
+    )
 
     # import-archive
     p_imp = sub.add_parser(
         "import-archive", help="Import an existing yt-dlp archive.txt"
     )
     p_imp.add_argument("file", help="Path to the archive.txt file")
-    p_imp.add_argument("--collection", required=True, help="Target collection name")
+    p_imp.add_argument(
+        "--collection",
+        required=False,
+        default=None,
+        help="Target collection name (if omitted, collections are auto-created per channel)",
+    )
 
     # status
     sub.add_parser("status", help="Show database stats")
