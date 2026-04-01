@@ -1,0 +1,21 @@
+{
+  "outtmpl": "%(uploader)s (%(uploader_id)s)/%(upload_date)s - %(title)s - (%(duration)ss) [%(resolution)s] [%(id)s].%(ext)s",
+  "paths": {
+    "home": "/mnt/archive/youtube",
+    "temp": "/home/archiver/.yt-dlp"
+  },
+  "sleep_interval": 2,
+  "max_sleep_interval": 6,
+  "merge_output_format": "mkv",
+  "writesubtitles": true,
+  "allsubtitles": true,
+  "writedescription": true,
+  "writethumbnail": true,
+  "cookiefile": "cookies.txt",
+  "verbose": true,
+  "sub-lang": "all,-live_chat",
+  "postprocessors": [
+    { "key": "FFmpegSubtitlesConvertor", "format": "srt" },
+    { "key": "FFmpegMetadata" }
+  ]
+}

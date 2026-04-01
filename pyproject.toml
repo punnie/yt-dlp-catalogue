@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yt-archive"
+version = "0.1.0"
+description = "A thin wrapper around yt-dlp that catalogues downloads in SQLite."
+requires-python = ">=3.11"
+dependencies = [
+    "yt-dlp",
+]
+
+[project.scripts]
+yt-archive = "yt_archive:main"
+
+[tool.setuptools]
+py-modules = ["yt_archive"]
+
+[tool.setuptools.package-dir]
+"" = "src"
