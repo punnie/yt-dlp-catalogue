@@ -4,6 +4,7 @@ yt-archive: a thin wrapper around yt-dlp that catalogues downloads in SQLite.
 """
 
 import argparse
+import copy
 import json
 import os
 import sqlite3
@@ -106,7 +107,7 @@ def load_config(path: Path | None = None) -> dict:
 
 def config_to_ytdlp_opts(cfg: dict) -> dict:
     """Return a yt-dlp options dict from the config. Keys pass straight through."""
-    opts = dict(cfg)
+    opts = copy.deepcopy(cfg)
     # Always ignore errors so one bad video doesn't abort the whole run
     opts.setdefault("ignoreerrors", True)
     return opts
