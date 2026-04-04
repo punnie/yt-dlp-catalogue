@@ -199,28 +199,76 @@ def sync_collection(
     opts = config_to_ytdlp_opts(cfg)
     opts["download_archive"] = str(archive_path)
 
-    # postprocessor_hooks stashes the info_dict keyed by filepath after each
-    # PP stage.  post_hooks fires once after all post-processing AND the file
-    # move to the final destination (NFS), so the DB insert only happens when
-    # the file is safely in place.
-    pending_info: dict[str, dict] = {}
+    # We key pending_info by video ID (not filepath) because post-processors
+    # can change the filepath (e.g. merge → .mkv, subtitle conversion, etc.),
+    # causing a mismatch between what pp_hook stores and what post_hook receives.
+    #
+    # pp_hook fires after each post-processor stage and gives us info_dict with
+    # all the metadata.  We keep updating per video ID so we always have the
+    # latest info_dict (with the most up-to-date filepath).
+    #
+    # post_hook fires once after ALL post-processing with the final filepath.
+    # We cannot directly get the video ID from the filepath string alone, so we
+    # maintain a reverse mapping (filepath → video ID) that pp_hook keeps
+    # current.  post_hook looks up the video ID via the final filepath, then
+    # grabs the stashed info_dict, patches in the final filepath, and inserts.
+    pending_info: dict[str, dict] = {}  # video_id → info_dict
+    filepath_to_vid: dict[str, str] = {}  # filepath → video_id
 
     def pp_hook(d):
-        """Stash info_dict so post_hook can use it."""
-        if d.get("status") == "finished":
+        """Stash info_dict keyed by video ID after each PP stage."""
+        status = d.get("status")
+        postprocessor = d.get("postprocessor", "?")
+        print(f"  [pp_hook] status={status} postprocessor={postprocessor}")
+        if status == "finished":
             info = d.get("info_dict", {})
+            vid = info.get("id")
             filepath = info.get("filepath")
-            if filepath:
-                pending_info[filepath] = info
+            title = info.get("title")
+            print(
+                f"  [pp_hook] finished: vid={vid} title={title!r} filepath={filepath}"
+            )
+            if vid:
+                pending_info[vid] = info
+                if filepath:
+                    filepath_to_vid[filepath] = vid
+                print(
+                    f"  [pp_hook] stashed vid={vid}, filepath_to_vid has {len(filepath_to_vid)} entries"
+                )
+            else:
+                print(
+                    f"  [pp_hook] WARNING: no video ID in info_dict, keys={list(info.keys())[:10]}"
+                )
 
     def post_hook(filepath):
         """Called after all post-processing and file move. Insert into DB."""
-        info = pending_info.pop(filepath, {})
+        print(f"  [post_hook] called with filepath={filepath}")
+        print(f"  [post_hook] filepath_to_vid keys: {list(filepath_to_vid.keys())}")
+        vid = filepath_to_vid.pop(filepath, None)
+        if vid is None:
+            print(
+                f"  [post_hook] WARNING: filepath not found in filepath_to_vid, no vid match"
+            )
+        else:
+            print(f"  [post_hook] matched vid={vid}")
+        info = pending_info.pop(vid, {}) if vid else {}
+        has_metadata = bool(info.get("title"))
         extractor = info.get("extractor_key", info.get("ie_key", "youtube")).lower()
-        vid = info.get("id", "")
+        vid = vid or info.get("id", "")
+        print(
+            f"  [post_hook] vid={vid} extractor={extractor} has_metadata={has_metadata} title={info.get('title')!r}"
+        )
         if vid:
+            # Use the final filepath (the one post_hook received) so the DB
+            # records where the file actually ended up.
+            info["filepath"] = filepath
             _insert_video(
                 db, collection_id, extractor, vid, info=info, status="downloaded"
+            )
+            print(f"  [post_hook] inserted vid={vid} with metadata via post_hook")
+        else:
+            print(
+                f"  [post_hook] WARNING: no vid, skipping DB insert (will rely on archive diff fallback)"
             )
 
     opts["postprocessor_hooks"] = [pp_hook]
@@ -230,11 +278,27 @@ def sync_collection(
         with YoutubeDL(opts) as ydl:
             ydl.download([collection_url])
     finally:
-        # Also pick up anything the hooks missed by diffing the archive file
+        # Also pick up anything the hooks missed by diffing the archive file.
+        # If pending_info still has entries the post_hook never consumed, use
+        # them so we don't lose metadata.
         known_after = _read_archive_file(archive_path)
         new_entries = known_after - known_before
+        print(
+            f"  [fallback] archive diff: {len(new_entries)} new entries, {len(pending_info)} leftover in pending_info"
+        )
+        if pending_info:
+            print(
+                f"  [fallback] leftover pending_info vids: {list(pending_info.keys())}"
+            )
         for extractor, vid in new_entries:
-            _insert_video(db, collection_id, extractor, vid, status="downloaded")
+            info = pending_info.pop(vid, {})
+            has_metadata = bool(info.get("title"))
+            print(
+                f"  [fallback] inserting extractor={extractor} vid={vid} has_metadata={has_metadata} title={info.get('title')!r}"
+            )
+            _insert_video(
+                db, collection_id, extractor, vid, info=info, status="downloaded"
+            )
 
         archive_path.unlink(missing_ok=True)
 
