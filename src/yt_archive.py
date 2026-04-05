@@ -116,7 +116,7 @@ def config_to_ytdlp_opts(cfg: dict) -> dict:
     # match_filter must be a callable when using the Python API, so we compile
     # the filter expression string via match_filter_func().
     if "match_filter" not in opts:
-        opts["match_filter"] = match_filter_func("!is_live&!live_status=is_live")
+        opts["match_filter"] = match_filter_func("!is_live&live_status!=is_live")
     elif isinstance(opts["match_filter"], str):
         opts["match_filter"] = match_filter_func(opts["match_filter"])
     return opts
