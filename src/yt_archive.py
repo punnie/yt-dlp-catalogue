@@ -110,6 +110,8 @@ def config_to_ytdlp_opts(cfg: dict) -> dict:
     opts = copy.deepcopy(cfg)
     # Always ignore errors so one bad video doesn't abort the whole run
     opts.setdefault("ignoreerrors", True)
+    # Skip live streams — they hang forever waiting for the stream to end
+    opts.setdefault("match_filter", "!is_live & !live_status=is_live")
     return opts
 
 

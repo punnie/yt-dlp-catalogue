@@ -13,7 +13,7 @@
   "writethumbnail": true,
   "cookiefile": "cookies.txt",
   "verbose": true,
-  "sub-lang": "all,-live_chat",
+  "subtitleslangs": ["all", "-live_chat"],
   "postprocessors": [
     { "key": "FFmpegSubtitlesConvertor", "format": "srt" },
     { "key": "FFmpegMetadata" }
