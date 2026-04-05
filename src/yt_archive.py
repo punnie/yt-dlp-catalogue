@@ -107,11 +107,18 @@ def load_config(path: Path | None = None) -> dict:
 
 def config_to_ytdlp_opts(cfg: dict) -> dict:
     """Return a yt-dlp options dict from the config. Keys pass straight through."""
+    from yt_dlp.utils import match_filter_func
+
     opts = copy.deepcopy(cfg)
     # Always ignore errors so one bad video doesn't abort the whole run
     opts.setdefault("ignoreerrors", True)
     # Skip live streams — they hang forever waiting for the stream to end
-    opts.setdefault("match_filter", "!is_live & !live_status=is_live")
+    # match_filter must be a callable when using the Python API, so we compile
+    # the filter expression string via match_filter_func().
+    if "match_filter" not in opts:
+        opts["match_filter"] = match_filter_func("!is_live & !live_status=is_live")
+    elif isinstance(opts["match_filter"], str):
+        opts["match_filter"] = match_filter_func(opts["match_filter"])
     return opts
 
 
