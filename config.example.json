@@ -12,6 +12,7 @@
   "writedescription": true,
   "writethumbnail": true,
   "cookiefile": "cookies.txt",
+  "match_filter": "!is_live&live_status!=is_live&filesize_approx <? 10737418240",
   "verbose": true,
   "subtitleslangs": ["all", "-live_chat"],
   "postprocessors": [
