@@ -613,19 +613,42 @@ def _resolve_collections(db, args) -> list[sqlite3.Row]:
 
 
 def _get_scheduled_collections(db: sqlite3.Connection) -> list[sqlite3.Row]:
-    """Return enabled collections whose sync is due based on their interval."""
+    """Return enabled collections whose sync is due based on their interval.
+
+    Collections with the same interval are staggered across the days of
+    that interval using ``collection_id % interval`` as a stable slot.
+    This spreads the load so that, e.g., half of the interval-2
+    collections sync on even days and the other half on odd days.
+    """
     now = datetime.now(timezone.utc)
+    day_number = int(now.timestamp() / 86400)  # days since epoch
     rows = db.execute("SELECT * FROM collections WHERE enabled = 1").fetchall()
     due = []
     for row in rows:
+        interval = row["sync_interval_days"]
         last = row["last_synced_at"]
+
+        # Never synced → always due
         if last is None:
             due.append(row)
             continue
+
         last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
-        elapsed = (now - last_dt).total_seconds() / 86400
-        if elapsed >= row["sync_interval_days"]:
+        elapsed_days = (now - last_dt).total_seconds() / 86400
+
+        # Already synced today → skip
+        if elapsed_days < 1:
+            continue
+
+        # Catch-up: overdue collections sync regardless of slot
+        if elapsed_days >= interval:
             due.append(row)
+            continue
+
+        # Stagger: this collection is due today if its slot matches
+        if day_number % interval == row["id"] % interval:
+            due.append(row)
+
     return due
 
 
