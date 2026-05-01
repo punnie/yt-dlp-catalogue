@@ -51,6 +51,13 @@
         yt-archive = mkPackage pkgs;
       });
 
+      overlays.default = final: prev: {
+        yt-archive = mkPackage final;
+      };
+
+      nixosModules.default = import ./nix/module.nix { inherit self; };
+      nixosModules.yt-archive = self.nixosModules.default;
+
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           packages = [
