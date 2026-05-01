@@ -16,16 +16,14 @@ from pathlib import Path
 # Database
 # ---------------------------------------------------------------------------
 
-SCHEMA = """
+SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS collections (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    name                TEXT    NOT NULL UNIQUE,
-    url                 TEXT    NOT NULL,
-    enabled             INTEGER NOT NULL DEFAULT 1,
-    sync_interval_days  INTEGER NOT NULL DEFAULT 1,
-    last_synced_at      TEXT,
-    created_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-    updated_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT    NOT NULL UNIQUE,
+    url         TEXT    NOT NULL,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 
 CREATE TABLE IF NOT EXISTS videos (
@@ -47,6 +45,16 @@ CREATE TABLE IF NOT EXISTS videos (
 );
 """
 
+MIGRATIONS = [
+    # Version 1 → 2: add scheduling columns
+    [
+        "ALTER TABLE collections ADD COLUMN sync_interval_days INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE collections ADD COLUMN last_synced_at TEXT",
+    ],
+]
+
+CURRENT_VERSION = 1 + len(MIGRATIONS)
+
 
 def _db_path() -> Path:
     default = Path.home() / ".local" / "share" / "yt-archive" / "db.sqlite"
@@ -60,22 +68,44 @@ def get_db() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.executescript(SCHEMA)
-    _migrate(conn)
+    _ensure_schema(conn)
     return conn
 
 
-def _migrate(conn: sqlite3.Connection):
-    """Add columns that may be missing from older databases."""
-    cols = {
-        row[1] for row in conn.execute("PRAGMA table_info(collections)").fetchall()
-    }
-    if "sync_interval_days" not in cols:
-        conn.execute(
-            "ALTER TABLE collections ADD COLUMN sync_interval_days INTEGER NOT NULL DEFAULT 1"
-        )
-    if "last_synced_at" not in cols:
-        conn.execute("ALTER TABLE collections ADD COLUMN last_synced_at TEXT")
+def _get_schema_version(conn: sqlite3.Connection) -> int:
+    has_table = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_version'"
+    ).fetchone()[0]
+    if not has_table:
+        return 0
+    row = conn.execute("SELECT version FROM schema_version").fetchone()
+    return row["version"] if row else 0
+
+
+def _set_schema_version(conn: sqlite3.Connection, version: int):
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
+    conn.execute("DELETE FROM schema_version")
+    conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+
+
+def _ensure_schema(conn: sqlite3.Connection):
+    version = _get_schema_version(conn)
+
+    if version == 0:
+        has_tables = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='collections'"
+        ).fetchone()[0]
+        if has_tables:
+            version = 1
+        else:
+            conn.executescript(SCHEMA_V1)
+            version = 1
+
+    for i in range(version - 1, len(MIGRATIONS)):
+        for stmt in MIGRATIONS[i]:
+            conn.execute(stmt)
+
+    _set_schema_version(conn, CURRENT_VERSION)
     conn.commit()
 
 
