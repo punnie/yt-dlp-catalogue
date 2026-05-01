@@ -4,8 +4,20 @@
 let
   cfg = config.services.yt-archive;
 
-  configFile = pkgs.writeText "yt-archive-config.json"
-    (builtins.toJSON cfg.settings);
+  settingsFormat = pkgs.formats.json { };
+  configFile = settingsFormat.generate "yt-archive-config.json" cfg.settings;
+
+  # Wrapper that bakes in YT_ARCHIVE_DB and YT_ARCHIVE_CONFIG so that running
+  # the CLI as the service user (e.g. `sudo -u yt-archive yt-archive add ...`)
+  # always targets the same database and config as the scheduled timer. We
+  # only set the env vars when they aren't already exported, so callers can
+  # still override them ad-hoc.
+  wrapper = pkgs.writeShellScriptBin "yt-archive" ''
+    : "''${YT_ARCHIVE_DB:=${cfg.database}}"
+    : "''${YT_ARCHIVE_CONFIG:=${configFile}}"
+    export YT_ARCHIVE_DB YT_ARCHIVE_CONFIG
+    exec ${cfg.package}/bin/yt-archive "$@"
+  '';
 in
 {
   options.services.yt-archive = {
@@ -54,7 +66,7 @@ in
     };
 
     settings = lib.mkOption {
-      type = lib.types.attrsOf lib.types.anything;
+      type = settingsFormat.type;
       default = { };
       example = lib.literalExpression ''
         {
@@ -147,7 +159,10 @@ in
       yt-archive = { };
     };
 
-    environment.systemPackages = [ cfg.package ];
+    # Install the wrapper rather than the raw package so interactive use
+    # (e.g. `sudo -u yt-archive yt-archive add ...`) hits the same DB and
+    # config as the timer.
+    environment.systemPackages = [ wrapper ];
 
     systemd.tmpfiles.rules = [
       "d ${cfg.dataDir} 0750 ${cfg.user} ${cfg.group} - -"
@@ -158,11 +173,11 @@ in
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
 
-      environment = {
-        YT_ARCHIVE_DB = cfg.database;
-        YT_ARCHIVE_CONFIG = "${configFile}";
-        HOME = cfg.dataDir;
-      };
+      # The wrapper sets YT_ARCHIVE_DB / YT_ARCHIVE_CONFIG itself; we only
+      # need to ensure HOME points at the data directory so yt-dlp's cache
+      # (~/.cache/yt-dlp) lands inside the writable dataDir rather than
+      # somewhere blocked by ProtectHome=.
+      environment.HOME = cfg.dataDir;
 
       serviceConfig = {
         Type = "oneshot";
@@ -170,7 +185,7 @@ in
         Group = cfg.group;
         WorkingDirectory = cfg.dataDir;
         ExecStart = lib.escapeShellArgs (
-          [ "${cfg.package}/bin/yt-archive" "sync" "--scheduled" ]
+          [ "${wrapper}/bin/yt-archive" "sync" "--scheduled" ]
           ++ cfg.extraSyncArgs
         );
 

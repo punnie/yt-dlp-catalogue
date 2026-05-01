@@ -74,15 +74,20 @@ Notable options:
 | `extraSyncArgs` | `[]` | Appended to `yt-archive sync --scheduled`. |
 | `extraReadWritePaths` | `[]` | The unit is sandboxed with `ProtectSystem=strict` + `ProtectHome=true`. List any download/temp directories outside `dataDir` (e.g. `/mnt/archive/youtube`) so the service can write to them. |
 
-The `yt-archive` CLI is added to `environment.systemPackages`, so you
-can manage collections (`yt-archive add`, `set-interval`, `list`, …)
-directly on the host. Run them as the service user so they hit the
-same database:
+A wrapper around the `yt-archive` CLI is added to
+`environment.systemPackages`, so you can manage collections
+(`yt-archive add`, `set-interval`, `list`, …) directly on the host.
+The wrapper bakes in `YT_ARCHIVE_DB` and `YT_ARCHIVE_CONFIG`, so
+invocations automatically hit the same database and config as the
+timer. Run as the service user so writes use the right uid:
 
 ```sh
 sudo -u yt-archive yt-archive add my-channel https://www.youtube.com/@SomeChannel
 sudo -u yt-archive yt-archive set-interval my-channel 7
 ```
+
+The wrapper only sets those env vars when they are unset, so you can
+still override either by exporting them explicitly.
 
 You can trigger an off-schedule run with `systemctl start
 yt-archive-sync.service` and check the timer with `systemctl
