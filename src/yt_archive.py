@@ -17,7 +17,7 @@ from pathlib import Path
 # Database
 # ---------------------------------------------------------------------------
 
-SCHEMA = """
+SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS collections (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT    NOT NULL UNIQUE,
@@ -46,6 +46,16 @@ CREATE TABLE IF NOT EXISTS videos (
 );
 """
 
+MIGRATIONS = [
+    # Version 1 → 2: add scheduling columns
+    [
+        "ALTER TABLE collections ADD COLUMN sync_interval_days INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE collections ADD COLUMN last_synced_at TEXT",
+    ],
+]
+
+CURRENT_VERSION = 1 + len(MIGRATIONS)
+
 
 def _db_path() -> Path:
     default = Path.home() / ".local" / "share" / "yt-archive" / "db.sqlite"
@@ -59,8 +69,45 @@ def get_db() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.executescript(SCHEMA)
+    _ensure_schema(conn)
     return conn
+
+
+def _get_schema_version(conn: sqlite3.Connection) -> int:
+    has_table = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_version'"
+    ).fetchone()[0]
+    if not has_table:
+        return 0
+    row = conn.execute("SELECT version FROM schema_version").fetchone()
+    return row["version"] if row else 0
+
+
+def _set_schema_version(conn: sqlite3.Connection, version: int):
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
+    conn.execute("DELETE FROM schema_version")
+    conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+
+
+def _ensure_schema(conn: sqlite3.Connection):
+    version = _get_schema_version(conn)
+
+    if version == 0:
+        has_tables = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='collections'"
+        ).fetchone()[0]
+        if has_tables:
+            version = 1
+        else:
+            conn.executescript(SCHEMA_V1)
+            version = 1
+
+    for i in range(version - 1, len(MIGRATIONS)):
+        for stmt in MIGRATIONS[i]:
+            conn.execute(stmt)
+
+    _set_schema_version(conn, CURRENT_VERSION)
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -621,8 +668,12 @@ def cmd_list(args):
 
     for r in rows:
         enabled = "enabled" if r["enabled"] else "disabled"
-        print(f"  [{r['id']}] {r['name']} ({enabled}) — {r['video_count']} videos")
+        interval = r["sync_interval_days"]
+        interval_label = "daily" if interval == 1 else f"every {interval} days"
+        last = r["last_synced_at"] or "never"
+        print(f"  [{r['id']}] {r['name']} ({enabled}, {interval_label}) — {r['video_count']} videos")
         print(f"      {r['url']}")
+        print(f"      last synced: {last}")
 
 
 def cmd_remove(args):
@@ -638,7 +689,9 @@ def cmd_remove(args):
 
 
 def _resolve_collections(db, args) -> list[sqlite3.Row]:
-    if args.all:
+    if getattr(args, "scheduled", False):
+        return _get_scheduled_collections(db)
+    elif args.all:
         return db.execute("SELECT * FROM collections WHERE enabled = 1").fetchall()
     elif args.name:
         row = db.execute(
@@ -649,8 +702,57 @@ def _resolve_collections(db, args) -> list[sqlite3.Row]:
             sys.exit(1)
         return [row]
     else:
-        print("Error: provide a collection name or --all.", file=sys.stderr)
+        print("Error: provide a collection name, --all, or --scheduled.", file=sys.stderr)
         sys.exit(1)
+
+
+def _get_scheduled_collections(db: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Return enabled collections whose sync is due based on their interval.
+
+    Collections with the same interval are staggered across the days of
+    that interval using ``collection_id % interval`` as a stable slot.
+    This spreads the load so that, e.g., half of the interval-2
+    collections sync on even days and the other half on odd days.
+    """
+    now = datetime.now(timezone.utc)
+    day_number = int(now.timestamp() / 86400)  # days since epoch
+    rows = db.execute("SELECT * FROM collections WHERE enabled = 1").fetchall()
+    due = []
+    for row in rows:
+        interval = row["sync_interval_days"]
+        last = row["last_synced_at"]
+
+        # Never synced → always due
+        if last is None:
+            due.append(row)
+            continue
+
+        last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+        elapsed_days = (now - last_dt).total_seconds() / 86400
+
+        # Already synced today → skip
+        if elapsed_days < 1:
+            continue
+
+        # Catch-up: overdue collections sync regardless of slot
+        if elapsed_days >= interval:
+            due.append(row)
+            continue
+
+        # Stagger: this collection is due today if its slot matches
+        if day_number % interval == row["id"] % interval:
+            due.append(row)
+
+    return due
+
+
+def _mark_synced(db: sqlite3.Connection, collection_id: int):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    db.execute(
+        "UPDATE collections SET last_synced_at = ?, updated_at = ? WHERE id = ?",
+        (now, now, collection_id),
+    )
+    db.commit()
 
 
 def cmd_sync(args):
@@ -658,9 +760,15 @@ def cmd_sync(args):
     cfg = load_config(Path(args.config) if args.config else None)
     collections = _resolve_collections(db, args)
 
+    if not collections:
+        print("No collections are due for sync.")
+        db.close()
+        return
+
     for col in collections:
         print(f"Syncing '{col['name']}' ({col['url']})...")
         sync_collection(db, col["id"], col["url"], cfg)
+        _mark_synced(db, col["id"])
         print(f"Done syncing '{col['name']}'.")
 
     db.close()
@@ -708,6 +816,24 @@ def cmd_import(args):
     db.close()
 
 
+def cmd_set_interval(args):
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM collections WHERE name = ?", (args.name,)
+    ).fetchone()
+    if not row:
+        print(f"Error: collection '{args.name}' not found.", file=sys.stderr)
+        sys.exit(1)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    db.execute(
+        "UPDATE collections SET sync_interval_days = ?, updated_at = ? WHERE id = ?",
+        (args.days, now, row["id"]),
+    )
+    db.commit()
+    print(f"Set sync interval for '{args.name}' to every {args.days} day(s).")
+    db.close()
+
+
 def cmd_status(args):
     db = get_db()
     total_collections = db.execute("SELECT COUNT(*) as c FROM collections").fetchone()[
@@ -728,7 +854,8 @@ def cmd_status(args):
     )
 
     rows = db.execute(
-        "SELECT c.name, c.enabled, COUNT(v.id) as video_count, "
+        "SELECT c.name, c.enabled, c.sync_interval_days, c.last_synced_at, "
+        "COUNT(v.id) as video_count, "
         "SUM(CASE WHEN v.title IS NOT NULL THEN 1 ELSE 0 END) as with_meta "
         "FROM collections c LEFT JOIN videos v ON v.collection_id = c.id "
         "GROUP BY c.id ORDER BY c.name"
@@ -737,9 +864,12 @@ def cmd_status(args):
         print()
         for r in rows:
             enabled = "✓" if r["enabled"] else "✗"
+            interval = r["sync_interval_days"]
+            interval_label = "daily" if interval == 1 else f"every {interval}d"
+            last = r["last_synced_at"] or "never"
             print(
                 f"  {enabled} {r['name']}: {r['video_count']} videos "
-                f"({r['with_meta']} with metadata)"
+                f"({r['with_meta']} with metadata) [{interval_label}, last: {last}]"
             )
 
     db.close()
@@ -775,6 +905,11 @@ def main():
     p_sync_g.add_argument(
         "--all", action="store_true", help="Sync all enabled collections"
     )
+    p_sync_g.add_argument(
+        "--scheduled",
+        action="store_true",
+        help="Sync only collections that are due based on their sync interval",
+    )
 
     # fetch-metadata
     p_meta = sub.add_parser(
@@ -802,6 +937,15 @@ def main():
         help="Target collection name (if omitted, collections are auto-created per channel)",
     )
 
+    # set-interval
+    p_interval = sub.add_parser(
+        "set-interval", help="Set the sync interval for a collection"
+    )
+    p_interval.add_argument("name", help="Collection name")
+    p_interval.add_argument(
+        "days", type=int, help="Sync interval in days (1 = daily, 7 = weekly, etc.)"
+    )
+
     # status
     sub.add_parser("status", help="Show database stats")
 
@@ -816,6 +960,7 @@ def main():
         "list": cmd_list,
         "remove": cmd_remove,
         "sync": cmd_sync,
+        "set-interval": cmd_set_interval,
         "fetch-metadata": cmd_fetch_metadata,
         "import-archive": cmd_import,
         "status": cmd_status,
