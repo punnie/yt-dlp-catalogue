@@ -17,26 +17,32 @@
       forAllSystems = f:
         nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
 
-      mkPackage = pkgs:
-        let
-          python = pkgs.python3;
-        in
-        python.pkgs.buildPythonApplication {
+      # The package builder. Exposed as a function of `pkgs` so consumers can
+      # call it against their own nixpkgs, or use `.override { yt-dlp = ...; }`
+      # on the resulting derivation to swap dependencies (notably yt-dlp,
+      # which often needs to track upstream master to keep up with site
+      # breakage).
+      packageFn =
+        { lib, python3, ffmpeg, yt-dlp ? python3.pkgs.yt-dlp }:
+        python3.pkgs.buildPythonApplication {
           pname = "yt-archive";
           version = "0.1.0";
           pyproject = true;
 
           src = ./.;
 
-          build-system = [ python.pkgs.setuptools ];
+          build-system = [ python3.pkgs.setuptools ];
 
-          dependencies = [ python.pkgs.yt-dlp ];
+          # `yt-dlp` is taken as an override-able input. Pass either
+          # `python3Packages.yt-dlp` (a Python module) or a derivation built
+          # the same way — anything that exposes the `yt_dlp` import.
+          dependencies = [ yt-dlp ];
 
           doCheck = false;
 
           # yt-dlp needs ffmpeg at runtime for merging/conversion
           makeWrapperArgs = [
-            "--prefix" "PATH" ":" "${pkgs.lib.makeBinPath [ pkgs.ffmpeg ]}"
+            "--prefix" "PATH" ":" "${lib.makeBinPath [ ffmpeg ]}"
           ];
 
           meta = {
@@ -44,6 +50,8 @@
             mainProgram = "yt-archive";
           };
         };
+
+      mkPackage = pkgs: pkgs.callPackage packageFn { };
     in
     {
       packages = forAllSystems (pkgs: {
@@ -57,6 +65,12 @@
 
       nixosModules.default = import ./nix/module.nix { inherit self; };
       nixosModules.yt-archive = self.nixosModules.default;
+
+      # Exposed so downstream flakes can build the package against their own
+      # nixpkgs / overrides without going through `packages.${system}`.
+      lib = {
+        inherit packageFn mkPackage;
+      };
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {

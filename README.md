@@ -95,3 +95,106 @@ list-timers yt-archive-sync.timer`.
 
 If you'd rather pull in just the package (no service), the flake also
 exports `overlays.default`, which adds `pkgs.yt-archive`.
+
+### Using a newer yt-dlp
+
+yt-dlp tends to break whenever YouTube ships changes, and fixes often
+land in the upstream `master` branch days before they reach this
+flake's pinned `nixpkgs`. The package is structured so you can swap
+the `yt-dlp` it depends on without forking the flake. There are two
+good patterns; pick whichever fits your setup.
+
+**Pattern A — pin yt-dlp via a `nixpkgs` follower or `master` input.**
+Add a second nixpkgs input that tracks `master` (or any branch with
+the fix you need) and graft its `yt-dlp` source onto the package's
+own `yt-dlp` derivation. Reusing the flake's own `python3` avoids the
+`Python version mismatch` error you'd otherwise get when mixing
+derivations from two different nixpkgs.
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs-master.url = "github:NixOS/nixpkgs/master";
+    yt-archive.url = "github:punnie/yt-dlp-catalogue";
+  };
+
+  outputs = { self, nixpkgs, nixpkgs-master, yt-archive, ... }: {
+    nixosConfigurations.host = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        yt-archive.nixosModules.default
+        ({ pkgs, ... }: {
+          services.yt-archive = {
+            enable = true;
+            package = yt-archive.packages.${pkgs.system}.default.override {
+              yt-dlp =
+                let
+                  flakePkgs = yt-archive.inputs.nixpkgs.legacyPackages.${pkgs.system};
+                  master    = nixpkgs-master.legacyPackages.${pkgs.system};
+                in
+                flakePkgs.python3.pkgs.yt-dlp.overridePythonAttrs (_: {
+                  inherit (master.python3.pkgs.yt-dlp) version src;
+                });
+            };
+            settings = { /* ... */ };
+          };
+        })
+      ];
+    };
+  };
+}
+```
+
+This grafts master's `version` + `src` onto the build recipe from the
+flake's nixpkgs. If master added or removed a Python dependency,
+this won't work and you want Pattern B.
+
+**Pattern B — build the whole package against your own nixpkgs.**
+The flake exposes `lib.mkPackage`, which takes a `pkgs` set and
+returns the package built against it. Point it at any nixpkgs you
+like — `nixpkgs-master`, your system's `pkgs`, or a custom overlay
+that ships a newer `python3Packages.yt-dlp`:
+
+```nix
+services.yt-archive = {
+  enable = true;
+  package = yt-archive.lib.mkPackage nixpkgs-master.legacyPackages.${pkgs.system};
+};
+```
+
+or, equivalently, with an overlay that bumps `yt-dlp`:
+
+```nix
+services.yt-archive = {
+  enable = true;
+  package = yt-archive.lib.mkPackage (import nixpkgs {
+    inherit (pkgs) system;
+    overlays = [
+      (final: prev: {
+        python3 = prev.python3.override {
+          packageOverrides = pyFinal: pyPrev: {
+            yt-dlp = pyPrev.yt-dlp.overridePythonAttrs (_: {
+              version = "2025.99.99";
+              src = prev.fetchFromGitHub {
+                owner = "yt-dlp"; repo = "yt-dlp";
+                rev = "<commit>"; hash = "sha256-...";
+              };
+            });
+          };
+        };
+      })
+    ];
+  });
+};
+```
+
+Pattern B is heavier (builds Python deps against a different nixpkgs)
+but has zero version-mismatch risk and works even when yt-dlp's
+dependency closure changes.
+
+If you only need the CLI on a non-NixOS host, `nix run
+github:punnie/yt-dlp-catalogue --override-input nixpkgs
+github:NixOS/nixpkgs/master -- sync ...` is the quick-and-dirty
+equivalent — overrides the whole nixpkgs input for that one
+invocation.
